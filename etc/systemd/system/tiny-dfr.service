@@ -7,6 +7,8 @@ Wants=dev-tiny_dfr_display_backlight.device
 [Service]
 ExecStart=/usr/bin/tiny-dfr
 Restart=always
+# Holds the accessibility socket, /run/tiny-dfr/a11y.sock
+RuntimeDirectory=tiny-dfr
 
 NoNewPrivileges=true
 ProtectSystem=strict

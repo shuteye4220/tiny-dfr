@@ -23,6 +23,31 @@ pub struct Config {
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
+    pub touch_explore: TouchExplore,
+}
+
+/// When the Touch Bar is in touch exploration (screen reader) mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TouchExplore {
+    /// While an accessibility client is connected.
+    Auto,
+    Always,
+    Never,
+}
+
+impl TouchExplore {
+    fn parse(value: &str) -> TouchExplore {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => TouchExplore::Auto,
+            "always" => TouchExplore::Always,
+            "never" => TouchExplore::Never,
+            other => {
+                // Not worth taking the whole bar down over.
+                eprintln!("Invalid TouchExplore value {other:?}, using \"auto\"");
+                TouchExplore::Auto
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -35,6 +60,7 @@ struct ConfigProxy {
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
+    touch_explore: Option<String>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
 }
@@ -72,6 +98,8 @@ pub struct ButtonConfig {
     #[serde(alias = "Svg")]
     pub icon: Option<String>,
     pub text: Option<String>,
+    /// Name announced by screen readers; derived from the button if unset.
+    pub label: Option<String>,
     pub theme: Option<String>,
     pub time: Option<String>,
     pub battery: Option<String>,
@@ -115,6 +143,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user.double_press_switch_layers.or(base.double_press_switch_layers);
+        base.touch_explore = user.touch_explore.or(base.touch_explore);
     };
     let mut media_layer_keys = base.media_layer_keys.unwrap();
     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
@@ -125,6 +154,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
                 ButtonConfig {
                     icon: None,
                     text: Some("esc".into()),
+                    label: None,
                     theme: None,
                     action: vec![Key::Esc],
                     stretch: None,
@@ -137,8 +167,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             );
         }
     }
-    let media_layer = FunctionLayer::with_config(media_layer_keys);
-    let fkey_layer = FunctionLayer::with_config(primary_layer_keys);
+    let media_layer = FunctionLayer::with_config(media_layer_keys, "Media keys");
+    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, "Function keys");
     let layers = if base.media_layer_default.unwrap() {
         [media_layer, fkey_layer]
     } else {
@@ -151,6 +181,11 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+        // Optional so that an older /usr/share config keeps working.
+        touch_explore: base
+            .touch_explore
+            .as_deref()
+            .map_or(TouchExplore::Auto, TouchExplore::parse),
     };
     (cfg, layers)
 }
@@ -213,5 +248,34 @@ impl ConfigManager {
     }
     pub fn fd(&self) -> &impl AsFd {
         &self.inotify_fd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_parses_with_touch_explore() {
+        let cfg: ConfigProxy = toml::from_str(include_str!("../share/tiny-dfr/config.toml")).unwrap();
+        assert_eq!(cfg.touch_explore.as_deref(), Some("auto"));
+        assert!(cfg.primary_layer_keys.unwrap().len() >= 12);
+    }
+
+    #[test]
+    fn label_and_touch_explore_are_accepted() {
+        let cfg: ConfigProxy = toml::from_str(
+            r#"
+            TouchExplore = "Never"
+            MediaLayerKeys = [ { Icon = "search", Action = "Search", Label = "Find" } ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.media_layer_keys.unwrap()[0].label.as_deref(), Some("Find"));
+        assert_eq!(
+            TouchExplore::parse(&cfg.touch_explore.unwrap()),
+            TouchExplore::Never
+        );
+        assert_eq!(TouchExplore::parse("bogus"), TouchExplore::Auto);
     }
 }

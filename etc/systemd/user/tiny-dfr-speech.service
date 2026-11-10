@@ -1,0 +1,20 @@
+[Unit]
+Description=Speak tiny-dfr Touch Bar buttons through the screen reader
+Documentation=https://github.com/AsahiLinux/tiny-dfr
+
+[Service]
+ExecStart=/usr/bin/tiny-dfr-speech
+Restart=on-failure
+RestartSec=5
+
+# The helper only needs the session bus, the speech server and tiny-dfr's
+# socket in /run.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

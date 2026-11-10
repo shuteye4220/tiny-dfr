@@ -40,6 +40,18 @@ ActiveBrightness = 128
 # A sensible value to try is around 200.
 DoublePressSwitchLayers = 0
 
+# Screen reader support (touch exploration).
+# In this mode touching the bar or sliding a finger along it announces the
+# button under the finger without pressing it. To press the button, either
+# double-tap anywhere on the bar (keep the finger down on the second tap to
+# hold the key), or keep one finger on the button and tap with another.
+# Speech comes from the tiny-dfr-speech helper running in your session.
+# "auto"   - on while tiny-dfr-speech is connected, which by default means
+#            while a screen reader is running
+# "always" - always on
+# "never"  - always off
+TouchExplore = "auto"
+
 # This key defines the contents of the primary layer
 # (the one with F{number} keys)
 # You can change the individual buttons, add, or remove them
@@ -48,6 +60,10 @@ DoublePressSwitchLayers = 0
 # Buttons can be made larger by setting the optional Stretch field
 # to a number greater than 1 (which means the button will take up
 # that many button spaces).
+# The optional Label field sets the name screen readers announce for a
+# button, e.g. { Icon = "search", Action = "Search", Label = "Spotlight" }.
+# Without it, text buttons are announced by their text and icon buttons by
+# the name of their action.
 PrimaryLayerKeys = [
     # Action defines the key code to send when the button is pressed
     # You can specify either a single key, or a key combo by

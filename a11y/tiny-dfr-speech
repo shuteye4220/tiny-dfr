@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Speak tiny-dfr Touch Bar buttons through the screen reader.
+
+tiny-dfr publishes what happens on the Touch Bar on a Unix socket. This
+helper runs in the user's session, connects to that socket and passes the
+announcements to Orca (speech and braille), or to Speech Dispatcher if Orca
+cannot be reached.
+
+While this helper is connected, tiny-dfr puts the bar in touch exploration
+mode. By default it therefore connects only while a screen reader is running,
+so the bar behaves normally for everyone else.
+"""
+
+import argparse
+import json
+import socket
+import subprocess
+import sys
+
+from gi.repository import Gio, GLib
+
+DEFAULT_SOCKET = "/run/tiny-dfr/a11y.sock"
+PROTOCOL_VERSION = 1
+RETRY_SECONDS = 3
+MAX_LINE = 4096
+MAX_LABEL = 200
+
+ORCA_NAME = "org.gnome.Orca.Service"
+ORCA_PATH = "/org/gnome/Orca/Service"
+ORCA_SPEECH_PATH = ORCA_PATH + "/SpeechAndVerbosityManager"
+ORCA_MODULE_IFACE = "org.gnome.Orca.Module"
+
+A11Y_NAME = "org.a11y.Bus"
+A11Y_PATH = "/org/a11y/bus"
+A11Y_STATUS_IFACE = "org.a11y.Status"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+
+def log(*args):
+    print("tiny-dfr-speech:", *args, file=sys.stderr, flush=True)
+
+
+def clean(label):
+    """Make text from the socket safe and sensible to hand to a synthesiser."""
+    if not isinstance(label, str):
+        return ""
+    text = "".join(ch if ch.isprintable() else " " for ch in label)
+    return " ".join(text.split())[:MAX_LABEL]
+
+
+class Speaker:
+    """Says things, through Orca when possible."""
+
+    def __init__(self, bus, backend):
+        self.bus = bus
+        self.backend = backend
+        self.orca_running = False
+        self._speechd = None
+        self._speechd_missing = False
+
+    def _use_orca(self):
+        if self.backend == "orca":
+            return self.bus is not None
+        return self.backend == "auto" and self.orca_running
+
+    def say(self, text, interrupt):
+        if not text:
+            return
+        if self.backend == "print":
+            print(text, flush=True)
+        elif self._use_orca():
+            self._say_orca(text, interrupt)
+        elif self.backend != "orca":
+            self._say_speechd(text, interrupt)
+
+    def _say_orca(self, text, interrupt):
+        if interrupt:
+            # Stops a queue building up as a finger slides across the bar.
+            # Best effort: not fatal if this Orca has no such command.
+            self.bus.call(
+                ORCA_NAME, ORCA_SPEECH_PATH, ORCA_MODULE_IFACE, "ExecuteCommand",
+                GLib.Variant("(sb)", ("InterruptSpeech", False)), None,
+                Gio.DBusCallFlags.NO_AUTO_START, 1000, None, None,
+            )
+
+        def done(bus, result):
+            try:
+                ok = bus.call_finish(result).unpack()[0]
+            except GLib.Error as error:
+                log("Orca did not take the message:", error.message)
+                ok = False
+            if not ok and self.backend == "auto":
+                self._say_speechd(text, interrupt)
+
+        self.bus.call(
+            ORCA_NAME, ORCA_PATH, ORCA_NAME, "PresentMessage",
+            GLib.Variant("(s)", (text,)), GLib.VariantType("(b)"),
+            Gio.DBusCallFlags.NO_AUTO_START, 1000, None, done,
+        )
+
+    def _say_speechd(self, text, interrupt):
+        if not self._speechd_missing:
+            for _attempt in range(2):
+                try:
+                    if self._speechd is None:
+                        import speechd
+                        self._speechd = speechd.SSIPClient("tiny-dfr-speech")
+                    if interrupt:
+                        self._speechd.cancel()
+                    self._speechd.speak(text)
+                    return
+                except ImportError:
+                    self._speechd_missing = True
+                    break
+                except Exception as error:  # connection lost; reconnect once
+                    log("Speech Dispatcher error:", error)
+                    self._speechd = None
+        try:
+            # No shell, and "--" so a label can never be read as an option.
+            subprocess.Popen(
+                ["spd-say", "--", text],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            log("cannot speak:", error)
+
+
+class Helper:
+    def __init__(self, args):
+        self.args = args
+        self.sock = None
+        self.watch_id = 0
+        self.retry_id = 0
+        self.buffer = b""
+        self.orca_running = False
+        self.screen_reader_enabled = False
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        except GLib.Error as error:
+            self.bus = None
+            log("no session bus:", error.message)
+            if args.when == "auto":
+                log("cannot tell whether a screen reader is running; "
+                    "use --when always")
+                sys.exit(1)
+        self.speaker = Speaker(self.bus, args.speech)
+        if self.bus is not None:
+            self._watch_bus()
+        self.sync()
+
+    # --- is a screen reader running? ------------------------------------
+
+    def _watch_bus(self):
+        Gio.bus_watch_name_on_connection(
+            self.bus, ORCA_NAME, Gio.BusNameWatcherFlags.NONE,
+            lambda *_: self._set_orca(True), lambda *_: self._set_orca(False),
+        )
+        # Covers screen readers without Orca's D-Bus service (older Orca, or
+        # Orca without python-dasbus installed).
+        self.bus.signal_subscribe(
+            None, PROPS_IFACE, "PropertiesChanged", A11Y_PATH, None,
+            Gio.DBusSignalFlags.NONE, self._on_a11y_changed,
+        )
+        Gio.bus_watch_name_on_connection(
+            self.bus, A11Y_NAME, Gio.BusNameWatcherFlags.NONE,
+            lambda *_: self._query_a11y(), lambda *_: self._set_enabled(False),
+        )
+
+    def _set_orca(self, running):
+        self.orca_running = running
+        self.speaker.orca_running = running
+        self.sync()
+
+    def _set_enabled(self, enabled):
+        self.screen_reader_enabled = bool(enabled)
+        self.sync()
+
+    def _query_a11y(self):
+        def done(bus, result):
+            try:
+                self._set_enabled(bus.call_finish(result).unpack()[0])
+            except GLib.Error:
+                self._set_enabled(False)
+
+        self.bus.call(
+            A11Y_NAME, A11Y_PATH, PROPS_IFACE, "Get",
+            GLib.Variant("(ss)", (A11Y_STATUS_IFACE, "ScreenReaderEnabled")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NO_AUTO_START, 2000,
+            None, done,
+        )
+
+    def _on_a11y_changed(self, _bus, _sender, _path, _iface, _signal, params):
+        iface, changed, invalidated = params.unpack()
+        if iface != A11Y_STATUS_IFACE:
+            return
+        if "ScreenReaderEnabled" in changed:
+            self._set_enabled(changed["ScreenReaderEnabled"])
+        elif "ScreenReaderEnabled" in invalidated:
+            self._query_a11y()
+
+    def wanted(self):
+        return (self.args.when == "always" or self.orca_running
+                or self.screen_reader_enabled)
+
+    # --- connection to tiny-dfr -----------------------------------------
+
+    def sync(self):
+        """Connect or disconnect to match whether we should be exploring."""
+        if self.wanted():
+            if self.sock is None and not self.retry_id:
+                self._connect()
+        else:
+            self._disconnect()
+            if self.retry_id:
+                GLib.source_remove(self.retry_id)
+                self.retry_id = 0
+
+    def _connect(self):
+        self.retry_id = 0
+        if self.sock is not None or not self.wanted():
+            return GLib.SOURCE_REMOVE
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self.args.socket)
+            sock.setblocking(False)
+        except OSError as error:
+            sock.close()
+            if self.args.verbose:
+                log("cannot reach tiny-dfr:", error)
+            # tiny-dfr may be restarting, e.g. around suspend.
+            self.retry_id = GLib.timeout_add_seconds(RETRY_SECONDS, self._connect)
+            return GLib.SOURCE_REMOVE
+        self.sock = sock
+        self.buffer = b""
+        self.watch_id = GLib.io_add_watch(
+            sock.fileno(), GLib.PRIORITY_DEFAULT,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            self._on_readable,
+        )
+        if self.args.verbose:
+            log("connected")
+        return GLib.SOURCE_REMOVE
+
+    def _disconnect(self):
+        if self.watch_id:
+            GLib.source_remove(self.watch_id)
+            self.watch_id = 0
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+            if self.args.verbose:
+                log("disconnected")
+
+    def _on_readable(self, _fd, _condition):
+        try:
+            data = self.sock.recv(MAX_LINE)
+        except BlockingIOError:
+            return GLib.SOURCE_CONTINUE
+        except OSError:
+            data = b""
+        if not data:
+            # tiny-dfr went away, or refused us. Returning SOURCE_REMOVE
+            # drops the watch, so do not remove it a second time.
+            self.watch_id = 0
+            self._disconnect()
+            self.retry_id = GLib.timeout_add_seconds(RETRY_SECONDS, self._connect)
+            return GLib.SOURCE_REMOVE
+        self.buffer += data
+        *lines, self.buffer = self.buffer.split(b"\n")
+        if len(self.buffer) > MAX_LINE:
+            self.buffer = b""
+        for line in lines:
+            self._handle(line)
+        return GLib.SOURCE_CONTINUE
+
+    def _handle(self, line):
+        try:
+            message = json.loads(line)
+            event = message["event"]
+        except (ValueError, KeyError, TypeError):
+            return
+        label = clean(message.get("label"))
+        if event == "focus":
+            self.speaker.say(label, interrupt=True)
+        elif event == "activate":
+            if self.args.on_activate == "speak":
+                self.speaker.say(label, interrupt=True)
+        elif event == "layer":
+            self.speaker.say(label, interrupt=False)
+        elif event == "hello":
+            if message.get("version") != PROTOCOL_VERSION:
+                log("tiny-dfr speaks protocol version",
+                    message.get("version"), "- this helper expects",
+                    PROTOCOL_VERSION)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--when", choices=["auto", "always"], default="auto",
+        help="auto: explore only while a screen reader is running (default); "
+             "always: explore whenever this helper runs")
+    parser.add_argument(
+        "--speech", choices=["auto", "orca", "speechd", "print"], default="auto",
+        help="auto: Orca if it is running, else Speech Dispatcher (default); "
+             "print: write announcements to standard output")
+    parser.add_argument(
+        "--on-activate", choices=["speak", "silent"], default="speak",
+        help="what to do when a button is pressed: repeat its name as "
+             "confirmation (default), or nothing")
+    parser.add_argument("--socket", default=DEFAULT_SOCKET,
+                        help="tiny-dfr accessibility socket (default: %(default)s)")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    Helper(args)
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
